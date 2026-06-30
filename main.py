@@ -1,4 +1,4 @@
-"""iBridge — 터치·키보드 입력 처리 추가"""
+"""iBridge — 메뉴 바·하드웨어 버튼·Wi-Fi 연결 다이얼로그"""
 
 import asyncio
 import contextlib
@@ -13,17 +13,19 @@ import av
 import requests
 from PyQt6.QtCore import Qt, QRect, QRectF, QSize, QTimer, pyqtSignal, QObject, QPoint
 from PyQt6.QtGui import (
-    QColor, QFont, QImage, QKeyEvent, QPainter, QPainterPath, QMouseEvent,
+    QAction, QColor, QFont, QImage, QKeyEvent, QKeySequence,
+    QMouseEvent, QPainter, QPainterPath,
 )
 from PyQt6.QtWidgets import (
-    QApplication, QMainWindow, QSizePolicy, QVBoxLayout, QWidget,
+    QApplication, QDialog, QDialogButtonBox, QLabel, QLineEdit,
+    QMainWindow, QSizePolicy, QVBoxLayout, QWidget,
 )
 
-from device import USBConnector, StreamServer
+from device import USBConnector, WiFiConnector, StreamServer
 
 logger = logging.getLogger(__name__)
 
-# ── HID 키 매핑 (Qt.Key int → USB HID usage 0x07) ────────────────────────────
+# ── HID 키 매핑 ───────────────────────────────────────────────────────────────
 def _build_key_map() -> dict[int, int]:
     m: dict[int, int] = {}
     for i in range(26):
@@ -172,7 +174,7 @@ class Bridge(QObject):
     status_changed      = pyqtSignal(str)
     server_ready        = pyqtSignal()
 
-# ── 화면 위젯 (터치·키보드 입력 추가) ───────────────────────────────────────
+# ── 화면 위젯 ─────────────────────────────────────────────────────────────────
 class ScreenWidget(QWidget):
     def __init__(self):
         super().__init__()
@@ -292,6 +294,29 @@ class PhoneFrame(QWidget):
         )
         p.fillPath(pill, QColor(210, 210, 210, 170))
 
+# ── Wi-Fi 연결 다이얼로그 ──────────────────────────────────────────────────────
+class WiFiDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Wi-Fi / 블루투스 연결")
+        self.setModal(True)
+        self.setMinimumWidth(340)
+        layout = QVBoxLayout(self)
+        layout.setSpacing(12)
+        layout.addWidget(QLabel("iPhone IP 주소를 입력하세요.\n(iPhone: 설정 → Wi-Fi → 연결된 네트워크 → IP 주소)"))
+        self._ip = QLineEdit()
+        self._ip.setPlaceholderText("예) 192.168.0.5")
+        layout.addWidget(self._ip)
+        btns = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        layout.addWidget(btns)
+
+    def ip(self) -> str:
+        return self._ip.text().strip()
+
 # ── 메인 윈도우 ───────────────────────────────────────────────────────────────
 class MainWindow(QMainWindow):
     def __init__(self, bridge: Bridge, server: StreamServer, video: VideoController):
@@ -299,12 +324,19 @@ class MainWindow(QMainWindow):
         self._bridge = bridge
         self._server = server
         self._video  = video
-        self._usb = USBConnector(
+        self._usb  = USBConnector(
             on_ready =lambda name: bridge.device_connected.emit(name),
             on_lost  =lambda: bridge.device_disconnected.emit(),
             on_status=lambda msg: bridge.status_changed.emit(msg),
         )
+        self._wifi = WiFiConnector(
+            on_ready =lambda name: bridge.device_connected.emit(name),
+            on_lost  =lambda: bridge.device_disconnected.emit(),
+            on_status=lambda msg: bridge.status_changed.emit(msg),
+        )
+        self._active: USBConnector | WiFiConnector = self._usb
         self._device_name = ""
+        self._conn_mode   = "USB"
         self._fps_cnt     = 0
 
         self.setWindowTitle("iBridge")
@@ -314,12 +346,53 @@ class MainWindow(QMainWindow):
         self._phone  = PhoneFrame(self._screen)
         self.setCentralWidget(self._phone)
 
+        self._build_menu()
         self._wire()
         self.resize(430, 900)
 
         self._fps_timer = QTimer()
         self._fps_timer.setInterval(1000)
         self._fps_timer.timeout.connect(self._tick)
+
+    def _build_menu(self):
+        mb = self.menuBar()
+        mb.setStyleSheet(
+            "QMenuBar { background:#111; color:#ddd; }"
+            "QMenuBar::item:selected { background:#333; }"
+            "QMenu { background:#1c1c1e; color:#ddd; border:1px solid #444; }"
+            "QMenu::item:selected { background:#0a84ff; }"
+        )
+
+        m_conn = mb.addMenu("연결")
+        self._act_usb = QAction("USB 자동 연결", self, checkable=True, checked=True)
+        self._act_usb.triggered.connect(self._use_usb)
+        m_conn.addAction(self._act_usb)
+
+        act_wifi = QAction("Wi-Fi / 블루투스...", self)
+        act_wifi.triggered.connect(self._show_wifi_dlg)
+        m_conn.addAction(act_wifi)
+
+        m_conn.addSeparator()
+        act_disc = QAction("연결 끊기", self)
+        act_disc.triggered.connect(lambda: schedule(self._disconnect()))
+        m_conn.addAction(act_disc)
+
+        m_btn = mb.addMenu("버튼")
+        _BTN_SHORTCUTS = [
+            ("Home",        "home",         "Ctrl+H"),
+            ("잠금",        "lock",         "Ctrl+L"),
+            ("볼륨 올리기", "volume-up",    "Ctrl+Up"),
+            ("볼륨 내리기", "volume-down",  "Ctrl+Down"),
+            ("음소거",      "mute",         "Ctrl+M"),
+            ("Siri",        "siri",         "Ctrl+Shift+S"),
+        ]
+        for label, name, sc in _BTN_SHORTCUTS:
+            act = QAction(label, self)
+            act.setShortcut(QKeySequence(sc))
+            act.triggered.connect(
+                lambda _, n=name: _fire("/button", {"name": n, "state": "press"})
+            )
+            m_btn.addAction(act)
 
     def _wire(self):
         self._bridge.frame_ready.connect(self._on_frame)
@@ -334,8 +407,8 @@ class MainWindow(QMainWindow):
 
     def _on_up(self, name: str):
         self._device_name = name
-        self.setWindowTitle(f"iBridge · {name}")
-        rsd = self._usb.current_rsd
+        self._update_title()
+        rsd = self._active.current_rsd
         schedule(self._server.start(rsd, on_ready=lambda: self._bridge.server_ready.emit()))
 
     def _on_down(self):
@@ -356,16 +429,58 @@ class MainWindow(QMainWindow):
     def _tick(self):
         fps = self._fps_cnt
         self._fps_cnt = 0
-        self.setWindowTitle(f"iBridge · {self._device_name} · {fps} fps")
+        self._update_title(fps)
+
+    def _update_title(self, fps: int = 0):
+        parts = ["iBridge"]
+        if self._device_name:
+            parts.append(self._device_name)
+            parts.append(self._conn_mode)
+        if fps:
+            parts.append(f"{fps} fps")
+        self.setWindowTitle(" · ".join(parts))
+
+    def _use_usb(self):
+        self._act_usb.setChecked(True)
+        self._conn_mode = "USB"
+        schedule(self._switch(self._usb))
+
+    def _show_wifi_dlg(self):
+        dlg = WiFiDialog(self)
+        if dlg.exec() == QDialog.DialogCode.Accepted and dlg.ip():
+            self._act_usb.setChecked(False)
+            self._conn_mode = "Wi-Fi"
+            schedule(self._switch_wifi(dlg.ip()))
+
+    async def _switch(self, connector):
+        await self._teardown()
+        await self._active.stop()
+        self._active = connector
+        await connector.start()
+
+    async def _switch_wifi(self, ip: str):
+        await self._teardown()
+        await self._active.stop()
+        self._active = self._wifi
+        await self._wifi.connect(ip)
+
+    async def _disconnect(self):
+        await self._teardown()
+        await self._active.stop()
 
     async def _teardown(self):
         await self._video.stop()
         await self._server.stop()
 
+    async def _shutdown(self):
+        await self._teardown()
+        await self._usb.stop()
+        await self._wifi.stop()
+
     def closeEvent(self, e):
         self._fps_timer.stop()
         try:
-            schedule(self._teardown()).result(timeout=3.0)
+            schedule(self._shutdown()).result(timeout=3.0)
         except Exception:
             pass
         e.accept()
