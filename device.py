@@ -182,3 +182,75 @@ class StreamServer:
     @property
     def running(self) -> bool:
         return bool(self._task and not self._task.done())
+
+
+# ── 앱 목록 조회 및 실행 ───────────────────────────────────────────────────────
+class AppManager:
+    """iPhone 설치 앱 조회 및 실행 (InstallationProxy + DVT)"""
+
+    def __init__(self):
+        self._rsd = None
+
+    def set_rsd(self, rsd):
+        self._rsd = rsd
+
+    def clear(self):
+        self._rsd = None
+
+    @property
+    def available(self) -> bool:
+        return self._rsd is not None
+
+    def _ld(self):
+        from pymobiledevice3.lockdown import create_using_remote
+        return create_using_remote(self._rsd)
+
+    def list_apps(self) -> list[dict]:
+        """사용자 앱 목록 반환 (동기). run_in_executor로 호출할 것."""
+        from pymobiledevice3.services.installation_proxy import InstallationProxyService
+        ld = self._ld()
+        proxy = InstallationProxyService(lockdown=ld)
+        apps = list(proxy.browse(
+            application_type='User',
+            attributes=[
+                'CFBundleDisplayName',
+                'CFBundleIdentifier',
+                'CFBundleName',
+                'CFBundleURLTypes',
+            ],
+        ))
+        return sorted(
+            apps,
+            key=lambda a: (a.get('CFBundleDisplayName') or a.get('CFBundleName') or '').lower(),
+        )
+
+    def launch_app(self, bundle_id: str, url_schemes: list = None) -> str:
+        """앱 실행. 성공 시 '' 반환, 실패 시 오류 메시지 반환."""
+        # 1차: DVT ProcessControl (Developer Mode 필요)
+        try:
+            ld = self._ld()
+            from pymobiledevice3.services.dvt.dvt_secure_socket_proxy import DvtSecureSocketProxyService
+            from pymobiledevice3.services.dvt.instruments.process_control import ProcessControl
+            with DvtSecureSocketProxyService(lockdown=ld) as dvt:
+                pc = ProcessControl(dvt)
+                pc.launch(bundle_id=bundle_id, kill_existing=True)
+            return ""
+        except Exception as e:
+            logger.debug("DVT launch failed for %s: %s", bundle_id, e)
+
+        # 2차: URL 스킴 (SpringBoard open_url)
+        if url_schemes:
+            try:
+                ld = self._ld()
+                from pymobiledevice3.services.springboard import SpringBoardServicesService
+                sbs = SpringBoardServicesService(lockdown=ld)
+                if hasattr(sbs, 'open_url'):
+                    sbs.open_url(f"{url_schemes[0]}://")
+                    return ""
+            except Exception as e:
+                logger.debug("URL scheme launch failed: %s", e)
+
+        return (
+            "앱 실행에 실패했습니다.\n"
+            "iPhone: 설정 → 개인정보 보호 및 보안 → 개발자 모드 활성화 후 재시도하세요."
+        )

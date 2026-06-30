@@ -18,19 +18,20 @@ from PyQt6.QtGui import (
 )
 from PyQt6.QtWidgets import (
     QApplication, QDialog, QDialogButtonBox, QLabel, QLineEdit,
-    QMainWindow, QSizePolicy, QVBoxLayout, QWidget,
+    QListWidget, QListWidgetItem, QMainWindow, QMessageBox,
+    QSizePolicy, QVBoxLayout, QWidget,
 )
 
-from device import USBConnector, WiFiConnector, StreamServer
+from device import USBConnector, WiFiConnector, StreamServer, AppManager
 
 logger = logging.getLogger(__name__)
 
-# ── HID 키 매핑 ───────────────────────────────────────────────────────────────
+# ── HID 키 매핑 (Qt.Key int → USB HID usage 0x07) ────────────────────────────
 def _build_key_map() -> dict[int, int]:
     m: dict[int, int] = {}
-    for i in range(26):
+    for i in range(26):                          # A–Z  → 4–29
         m[65 + i] = 4 + i
-    for i in range(9):
+    for i in range(9):                           # 1–9  → 30–38
         m[49 + i] = 30 + i
     m[int(Qt.Key.Key_0)]           = 39
     m[int(Qt.Key.Key_Return)]      = 40
@@ -52,7 +53,7 @@ def _build_key_map() -> dict[int, int]:
     m[int(Qt.Key.Key_Slash)]       = 56
     m[int(Qt.Key.Key_CapsLock)]    = 57
     f1 = int(Qt.Key.Key_F1)
-    for i in range(12):
+    for i in range(12):                          # F1–F12 → 58–69
         m[f1 + i] = 58 + i
     m[int(Qt.Key.Key_Delete)]   = 76
     m[int(Qt.Key.Key_Home)]     = 74
@@ -133,7 +134,7 @@ async def _video_loop(bridge: "Bridge", stop_ev: asyncio.Event):
                 async with sess.get("http://127.0.0.1:8080/stream.bin", timeout=to) as resp:
                     bridge.status_changed.emit("streaming")
                     while not stop_ev.is_set():
-                        hdr    = await resp.content.readexactly(5)
+                        hdr  = await resp.content.readexactly(5)
                         length = struct.unpack(">I", hdr[:4])[0]
                         ftype  = hdr[4]
                         data   = await resp.content.readexactly(length - 1)
@@ -176,6 +177,8 @@ class Bridge(QObject):
     device_disconnected = pyqtSignal()
     status_changed      = pyqtSignal(str)
     server_ready        = pyqtSignal()
+    apps_loaded         = pyqtSignal(list)
+    launch_error        = pyqtSignal(str)
 
 # ── 화면 위젯 ─────────────────────────────────────────────────────────────────
 class ScreenWidget(QWidget):
@@ -210,7 +213,8 @@ class ScreenWidget(QWidget):
             f = QFont()
             f.setPointSize(13)
             p.setFont(f)
-            p.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "iPhone을 연결하세요")
+            p.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter,
+                       "iPhone을 연결하세요")
 
     def _display_rect(self) -> QRect:
         if self._img_size.isEmpty():
@@ -320,6 +324,76 @@ class WiFiDialog(QDialog):
     def ip(self) -> str:
         return self._ip.text().strip()
 
+# ── 앱 목록 다이얼로그 ────────────────────────────────────────────────────────
+class AppLauncherDialog(QDialog):
+    launch_requested = pyqtSignal(str, list)   # bundle_id, url_schemes
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("앱 실행")
+        self.setMinimumSize(380, 560)
+        self._apps: list[dict] = []
+
+        layout = QVBoxLayout(self)
+        layout.setSpacing(8)
+        layout.setContentsMargins(12, 12, 12, 12)
+
+        self._search = QLineEdit()
+        self._search.setPlaceholderText("앱 검색 (이름 또는 Bundle ID)...")
+        self._search.textChanged.connect(self._filter)
+        layout.addWidget(self._search)
+
+        self._status = QLabel("앱 목록 로딩 중...")
+        self._status.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._status.setStyleSheet("color:#888; padding:20px;")
+        layout.addWidget(self._status)
+
+        self._list = QListWidget()
+        self._list.setStyleSheet(
+            "QListWidget{background:#111;border:1px solid #333;border-radius:6px;}"
+            "QListWidget::item{padding:8px 12px;border-bottom:1px solid #222;}"
+            "QListWidget::item:selected{background:#0a84ff;color:#fff;}"
+            "QListWidget::item:hover{background:#1c1c1e;}"
+        )
+        self._list.setHidden(True)
+        self._list.itemDoubleClicked.connect(self._on_launch)
+        layout.addWidget(self._list)
+
+        hint = QLabel("더블클릭으로 실행  |  Developer Mode가 활성화되어 있어야 합니다")
+        hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        hint.setStyleSheet("color:#555;font-size:11px;padding-top:4px;")
+        layout.addWidget(hint)
+
+    def set_apps(self, apps: list[dict]):
+        self._apps = apps
+        n = len(apps)
+        self._status.setText(f"앱 {n}개" if n else "설치된 앱 없음")
+        self._list.setHidden(False)
+        self._filter(self._search.text())
+
+    def set_error(self, msg: str):
+        self._status.setText(f"오류: {msg}")
+
+    def _filter(self, text: str):
+        self._list.clear()
+        t = text.lower()
+        for app in self._apps:
+            name = app.get('CFBundleDisplayName') or app.get('CFBundleName') or '알 수 없음'
+            bid  = app.get('CFBundleIdentifier', '')
+            if not t or t in name.lower() or t in bid.lower():
+                item = QListWidgetItem(f"{name}\n{bid}")
+                item.setData(Qt.ItemDataRole.UserRole, app)
+                self._list.addItem(item)
+
+    def _on_launch(self, item: QListWidgetItem):
+        app = item.data(Qt.ItemDataRole.UserRole)
+        bid = app.get('CFBundleIdentifier', '')
+        schemes: list[str] = []
+        for ut in (app.get('CFBundleURLTypes') or []):
+            schemes.extend(ut.get('CFBundleURLSchemes', []))
+        if bid:
+            self.launch_requested.emit(bid, schemes)
+
 # ── 메인 윈도우 ───────────────────────────────────────────────────────────────
 class MainWindow(QMainWindow):
     def __init__(self, bridge: Bridge, server: StreamServer, video: VideoController):
@@ -341,6 +415,8 @@ class MainWindow(QMainWindow):
         self._device_name = ""
         self._conn_mode   = "USB"
         self._fps_cnt     = 0
+        self._app_mgr     = AppManager()
+        self._app_dlg: Optional[AppLauncherDialog] = None
 
         self.setWindowTitle("iBridge")
         self.setStyleSheet("QMainWindow { background: #000; }")
@@ -351,12 +427,14 @@ class MainWindow(QMainWindow):
 
         self._build_menu()
         self._wire()
+
         self.resize(430, 900)
 
         self._fps_timer = QTimer()
         self._fps_timer.setInterval(1000)
         self._fps_timer.timeout.connect(self._tick)
 
+    # ── 메뉴 바 ───────────────────────────────────────────────────────────────
     def _build_menu(self):
         mb = self.menuBar()
         mb.setStyleSheet(
@@ -366,6 +444,7 @@ class MainWindow(QMainWindow):
             "QMenu::item:selected { background:#0a84ff; }"
         )
 
+        # 연결
         m_conn = mb.addMenu("연결")
         self._act_usb = QAction("USB 자동 연결", self, checkable=True, checked=True)
         self._act_usb.triggered.connect(self._use_usb)
@@ -380,14 +459,22 @@ class MainWindow(QMainWindow):
         act_disc.triggered.connect(lambda: schedule(self._disconnect()))
         m_conn.addAction(act_disc)
 
+        # 앱 실행
+        m_app = mb.addMenu("앱")
+        act_apps = QAction("앱 목록...", self)
+        act_apps.setShortcut(QKeySequence("Ctrl+A"))
+        act_apps.triggered.connect(self._show_app_list)
+        m_app.addAction(act_apps)
+
+        # 버튼 (키보드 단축키)
         m_btn = mb.addMenu("버튼")
         _BTN_SHORTCUTS = [
-            ("Home",        "home",         "Ctrl+H"),
-            ("잠금",        "lock",         "Ctrl+L"),
-            ("볼륨 올리기", "volume-up",    "Ctrl+Up"),
-            ("볼륨 내리기", "volume-down",  "Ctrl+Down"),
-            ("음소거",      "mute",         "Ctrl+M"),
-            ("Siri",        "siri",         "Ctrl+Shift+S"),
+            ("Home",       "home",         "Ctrl+H"),
+            ("잠금",       "lock",         "Ctrl+L"),
+            ("볼륨 올리기","volume-up",    "Ctrl+Up"),
+            ("볼륨 내리기","volume-down",  "Ctrl+Down"),
+            ("음소거",     "mute",         "Ctrl+M"),
+            ("Siri",       "siri",         "Ctrl+Shift+S"),
         ]
         for label, name, sc in _BTN_SHORTCUTS:
             act = QAction(label, self)
@@ -397,13 +484,17 @@ class MainWindow(QMainWindow):
             )
             m_btn.addAction(act)
 
+    # ── 시그널 연결 ───────────────────────────────────────────────────────────
     def _wire(self):
         self._bridge.frame_ready.connect(self._on_frame)
         self._bridge.device_connected.connect(self._on_up)
         self._bridge.device_disconnected.connect(self._on_down)
         self._bridge.status_changed.connect(self._on_status)
         self._bridge.server_ready.connect(self._on_srv_ready)
+        self._bridge.apps_loaded.connect(self._on_apps_loaded)
+        self._bridge.launch_error.connect(self._on_launch_error)
 
+    # ── 이벤트 핸들러 ─────────────────────────────────────────────────────────
     def _on_frame(self, data: bytes, w: int, h: int):
         self._screen.set_frame(data, w, h)
         self._fps_cnt += 1
@@ -412,6 +503,7 @@ class MainWindow(QMainWindow):
         self._device_name = name
         self._update_title()
         rsd = self._active.current_rsd
+        self._app_mgr.set_rsd(rsd)
         schedule(self._server.start(rsd, on_ready=lambda: self._bridge.server_ready.emit()))
 
     def _on_down(self):
@@ -419,6 +511,9 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("iBridge")
         self._fps_timer.stop()
         self._screen.clear()
+        self._app_mgr.clear()
+        if self._app_dlg:
+            self._app_dlg.set_error("기기 연결이 끊어졌습니다")
         schedule(self._teardown())
 
     def _on_srv_ready(self):
@@ -443,6 +538,49 @@ class MainWindow(QMainWindow):
             parts.append(f"{fps} fps")
         self.setWindowTitle(" · ".join(parts))
 
+    # ── 앱 목록 ───────────────────────────────────────────────────────────────
+    def _show_app_list(self):
+        if not self._app_mgr.available:
+            QMessageBox.information(self, "iBridge", "iPhone을 먼저 연결하세요.")
+            return
+        if self._app_dlg is None:
+            self._app_dlg = AppLauncherDialog(self)
+            self._app_dlg.launch_requested.connect(self._on_launch_app)
+        self._app_dlg.set_apps([])
+        self._app_dlg._status.setText("앱 목록 로딩 중...")
+        self._app_dlg._list.setHidden(True)
+        self._app_dlg.show()
+        self._app_dlg.raise_()
+        schedule(self._async_load_apps())
+
+    async def _async_load_apps(self):
+        loop = asyncio.get_event_loop()
+        try:
+            apps = await loop.run_in_executor(None, self._app_mgr.list_apps)
+            self._bridge.apps_loaded.emit(apps)
+        except Exception as e:
+            self._bridge.status_changed.emit(f"앱 목록 로드 실패: {e}")
+            self._bridge.apps_loaded.emit([])
+
+    def _on_apps_loaded(self, apps: list):
+        if self._app_dlg:
+            self._app_dlg.set_apps(apps)
+
+    def _on_launch_app(self, bundle_id: str, url_schemes: list):
+        schedule(self._async_launch(bundle_id, url_schemes))
+
+    async def _async_launch(self, bundle_id: str, url_schemes: list):
+        loop = asyncio.get_event_loop()
+        err = await loop.run_in_executor(
+            None, self._app_mgr.launch_app, bundle_id, url_schemes
+        )
+        if err:
+            self._bridge.launch_error.emit(err)
+
+    def _on_launch_error(self, msg: str):
+        QMessageBox.warning(self, "앱 실행 실패", msg)
+
+    # ── 연결 전환 ─────────────────────────────────────────────────────────────
     def _use_usb(self):
         self._act_usb.setChecked(True)
         self._conn_mode = "USB"
@@ -453,7 +591,8 @@ class MainWindow(QMainWindow):
         if dlg.exec() == QDialog.DialogCode.Accepted and dlg.ip():
             self._act_usb.setChecked(False)
             self._conn_mode = "Wi-Fi"
-            schedule(self._switch_wifi(dlg.ip()))
+            ip = dlg.ip()
+            schedule(self._switch_wifi(ip))
 
     async def _switch(self, connector):
         await self._teardown()
