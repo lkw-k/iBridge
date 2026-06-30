@@ -1,7 +1,8 @@
-"""iBridge — HEVC 영상 스트리밍 & iPhone 베젤 UI"""
+"""iBridge — 터치·키보드 입력 처리 추가"""
 
 import asyncio
 import contextlib
+import queue
 import struct
 import sys
 import threading
@@ -9,15 +10,70 @@ import logging
 from typing import Optional
 
 import av
-from PyQt6.QtCore import Qt, QRect, QRectF, QSize, QTimer, pyqtSignal, QObject
-from PyQt6.QtGui import QColor, QFont, QImage, QPainter, QPainterPath
+import requests
+from PyQt6.QtCore import Qt, QRect, QRectF, QSize, QTimer, pyqtSignal, QObject, QPoint
+from PyQt6.QtGui import (
+    QColor, QFont, QImage, QKeyEvent, QPainter, QPainterPath, QMouseEvent,
+)
 from PyQt6.QtWidgets import (
-    QApplication, QLabel, QMainWindow, QSizePolicy, QVBoxLayout, QWidget,
+    QApplication, QMainWindow, QSizePolicy, QVBoxLayout, QWidget,
 )
 
 from device import USBConnector, StreamServer
 
 logger = logging.getLogger(__name__)
+
+# ── HID 키 매핑 (Qt.Key int → USB HID usage 0x07) ────────────────────────────
+def _build_key_map() -> dict[int, int]:
+    m: dict[int, int] = {}
+    for i in range(26):
+        m[65 + i] = 4 + i
+    for i in range(9):
+        m[49 + i] = 30 + i
+    m[int(Qt.Key.Key_0)]           = 39
+    m[int(Qt.Key.Key_Return)]      = 40
+    m[int(Qt.Key.Key_Enter)]       = 40
+    m[int(Qt.Key.Key_Escape)]      = 41
+    m[int(Qt.Key.Key_Backspace)]   = 42
+    m[int(Qt.Key.Key_Tab)]         = 43
+    m[int(Qt.Key.Key_Space)]       = 44
+    m[int(Qt.Key.Key_Minus)]       = 45
+    m[int(Qt.Key.Key_Equal)]       = 46
+    m[int(Qt.Key.Key_BracketLeft)] = 47
+    m[int(Qt.Key.Key_BracketRight)]= 48
+    m[int(Qt.Key.Key_Backslash)]   = 49
+    m[int(Qt.Key.Key_Semicolon)]   = 51
+    m[int(Qt.Key.Key_Apostrophe)]  = 52
+    m[int(Qt.Key.Key_QuoteLeft)]   = 53
+    m[int(Qt.Key.Key_Comma)]       = 54
+    m[int(Qt.Key.Key_Period)]      = 55
+    m[int(Qt.Key.Key_Slash)]       = 56
+    m[int(Qt.Key.Key_CapsLock)]    = 57
+    f1 = int(Qt.Key.Key_F1)
+    for i in range(12):
+        m[f1 + i] = 58 + i
+    m[int(Qt.Key.Key_Delete)]   = 76
+    m[int(Qt.Key.Key_Home)]     = 74
+    m[int(Qt.Key.Key_End)]      = 77
+    m[int(Qt.Key.Key_PageUp)]   = 75
+    m[int(Qt.Key.Key_PageDown)] = 78
+    m[int(Qt.Key.Key_Right)]    = 79
+    m[int(Qt.Key.Key_Left)]     = 80
+    m[int(Qt.Key.Key_Down)]     = 81
+    m[int(Qt.Key.Key_Up)]       = 82
+    m[int(Qt.Key.Key_Control)]  = 0xE0
+    m[int(Qt.Key.Key_Shift)]    = 0xE1
+    m[int(Qt.Key.Key_Alt)]      = 0xE2
+    m[int(Qt.Key.Key_Meta)]     = 0xE3
+    return m
+
+_KEY_MAP = _build_key_map()
+_MOD_MAP = {
+    Qt.KeyboardModifier.ControlModifier: 0xE0,
+    Qt.KeyboardModifier.ShiftModifier:   0xE1,
+    Qt.KeyboardModifier.AltModifier:     0xE2,
+    Qt.KeyboardModifier.MetaModifier:    0xE3,
+}
 
 # ── asyncio 백그라운드 루프 ────────────────────────────────────────────────────
 _bg_loop: Optional[asyncio.AbstractEventLoop] = None
@@ -35,6 +91,31 @@ def _start_bg():
 
 def schedule(coro):
     return asyncio.run_coroutine_threadsafe(coro, _bg_loop)
+
+# ── 터치 HTTP 큐 ──────────────────────────────────────────────────────────────
+_touch_q: queue.Queue = queue.Queue(maxsize=5)
+
+def _touch_worker():
+    while True:
+        data = _touch_q.get()
+        try:
+            requests.post("http://127.0.0.1:8080/touch", json=data, timeout=0.3)
+        except Exception:
+            pass
+
+def _send_touch(data: dict):
+    if _touch_q.full():
+        try: _touch_q.get_nowait()
+        except queue.Empty: pass
+    try: _touch_q.put_nowait(data)
+    except queue.Full: pass
+
+def _fire(path: str, data: dict):
+    threading.Thread(
+        target=lambda: requests.post(
+            f"http://127.0.0.1:8080{path}", json=data, timeout=1
+        ), daemon=True,
+    ).start()
 
 # ── 비디오 루프 (asyncio) ─────────────────────────────────────────────────────
 async def _video_loop(bridge: "Bridge", stop_ev: asyncio.Event):
@@ -91,12 +172,16 @@ class Bridge(QObject):
     status_changed      = pyqtSignal(str)
     server_ready        = pyqtSignal()
 
-# ── 화면 위젯 (영상 표시만) ───────────────────────────────────────────────────
+# ── 화면 위젯 (터치·키보드 입력 추가) ───────────────────────────────────────
 class ScreenWidget(QWidget):
     def __init__(self):
         super().__init__()
         self._qimg: Optional[QImage] = None
         self._img_size = QSize(0, 0)
+        self._pressing = False
+        self._held: set[int] = set()
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.setMouseTracking(True)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.setMinimumSize(200, 400)
 
@@ -131,6 +216,53 @@ class ScreenWidget(QWidget):
         w, h = int(fw * s), int(fh * s)
         return QRect((ww - w) // 2, (wh - h) // 2, w, h)
 
+    def _to_hid(self, pos: QPoint) -> tuple[int, int]:
+        r = self._display_rect()
+        if r.width() <= 0 or r.height() <= 0:
+            return 0, 0
+        x = max(0.0, min(1.0, (pos.x() - r.x()) / r.width()))
+        y = max(0.0, min(1.0, (pos.y() - r.y()) / r.height()))
+        return int(x * 65535), int(y * 65535)
+
+    def mousePressEvent(self, e: QMouseEvent):
+        if e.button() == Qt.MouseButton.LeftButton:
+            self._pressing = True
+            self.setFocus()
+            x, y = self._to_hid(e.pos())
+            _send_touch({"type": "contact", "x": x, "y": y})
+
+    def mouseMoveEvent(self, e: QMouseEvent):
+        if self._pressing:
+            x, y = self._to_hid(e.pos())
+            _send_touch({"type": "contact", "x": x, "y": y})
+
+    def mouseReleaseEvent(self, e: QMouseEvent):
+        if e.button() == Qt.MouseButton.LeftButton and self._pressing:
+            self._pressing = False
+            x, y = self._to_hid(e.pos())
+            _send_touch({"type": "release", "x": x, "y": y})
+
+    def mouseDoubleClickEvent(self, e: QMouseEvent):
+        if e.button() == Qt.MouseButton.LeftButton:
+            x, y = self._to_hid(e.pos())
+            _send_touch({"type": "tap", "x": x, "y": y})
+
+    def keyPressEvent(self, e: QKeyEvent):
+        hid = _KEY_MAP.get(e.key())
+        if hid and hid not in self._held:
+            self._held.add(hid)
+            self._flush_keys(e.modifiers())
+
+    def keyReleaseEvent(self, e: QKeyEvent):
+        hid = _KEY_MAP.get(e.key())
+        if hid:
+            self._held.discard(hid)
+            self._flush_keys(e.modifiers())
+
+    def _flush_keys(self, mods):
+        mcs = [v for k, v in _MOD_MAP.items() if mods & k]
+        _fire("/key", {"usages": mcs + list(self._held)})
+
 # ── iPhone 베젤 프레임 ─────────────────────────────────────────────────────────
 class PhoneFrame(QWidget):
     _SIDE   = 14
@@ -160,7 +292,7 @@ class PhoneFrame(QWidget):
         )
         p.fillPath(pill, QColor(210, 210, 210, 170))
 
-# ── 메인 윈도우 (기본 스트리밍) ───────────────────────────────────────────────
+# ── 메인 윈도우 ───────────────────────────────────────────────────────────────
 class MainWindow(QMainWindow):
     def __init__(self, bridge: Bridge, server: StreamServer, video: VideoController):
         super().__init__()
@@ -242,6 +374,7 @@ class MainWindow(QMainWindow):
 def main():
     logging.basicConfig(level=logging.WARNING)
     _start_bg()
+    threading.Thread(target=_touch_worker, daemon=True, name="TouchHTTP").start()
 
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
