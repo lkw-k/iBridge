@@ -1,4 +1,4 @@
-"""iBridge — 메뉴 바·하드웨어 버튼·Wi-Fi 연결 다이얼로그"""
+"""iBridge — macOS iBridgeing 동일 기능 (네이티브 Qt 앱)"""
 
 import asyncio
 import contextlib
@@ -82,6 +82,9 @@ _bg_loop: Optional[asyncio.AbstractEventLoop] = None
 
 def _run_bg():
     global _bg_loop
+    # Windows에서 aiohttp는 SelectorEventLoop 필요 (ProactorLoop 비호환)
+    if sys.platform == "win32":
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
     _bg_loop = asyncio.new_event_loop()
     asyncio.set_event_loop(_bg_loop)
     _bg_loop.run_forever()
@@ -488,8 +491,21 @@ class MainWindow(QMainWindow):
 # ── 진입점 ────────────────────────────────────────────────────────────────────
 def main():
     logging.basicConfig(level=logging.WARNING)
+
+    # Windows: 콘솔 창 숨기기 (PyInstaller --windowed와 동일 효과)
+    if sys.platform == "win32":
+        import ctypes
+        ctypes.windll.user32.ShowWindow(ctypes.windll.kernel32.GetConsoleWindow(), 0)
+
     _start_bg()
     threading.Thread(target=_touch_worker, daemon=True, name="TouchHTTP").start()
+
+    # Windows High-DPI 스케일링 활성화
+    if sys.platform == "win32":
+        from PyQt6.QtCore import Qt as _Qt2
+        QApplication.setHighDpiScaleFactorRoundingPolicy(
+            _Qt2.HighDpiScaleFactorRoundingPolicy.PassThrough
+        )
 
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
