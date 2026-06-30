@@ -1,0 +1,6 @@
+pymobiledevice3>=9.31.0
+PyQt6>=6.6.0
+av>=10.0.0
+aiohttp>=3.9.0
+numpy>=1.24.0
+requests>=2.31.0
